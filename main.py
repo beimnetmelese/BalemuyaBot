@@ -1,9 +1,10 @@
 import os
 import logging
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
 # ---------------- Load environment ----------------
@@ -18,6 +19,13 @@ logging.basicConfig(level=logging.INFO)
 # ---------------- FastAPI App ----------------
 app = FastAPI()
 telegram_app: Application = None  # will initialize at startup
+
+
+class SendMessagePayload(BaseModel):
+    telegram_id: str
+    message: str
+    button_text: str
+    button_url: str
 
 # ---------------- Helper Functions ----------------
 def get_user_services(telegram_id):
@@ -73,12 +81,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact = update.message.contact if update.message else None
+    if not contact:
+        return
+
+    telegram_id = contact.user_id or (update.effective_user.id if update.effective_user else None)
+    phone_number = contact.phone_number
+
+    if not telegram_id or not phone_number:
+        await update.message.reply_text("Failed to read your phone number. Please try again.")
+        return
+
+    payload = {
+        "telegram_id": str(telegram_id),
+        "phone_number": phone_number,
+    }
+
+    # Best-effort fill for name/username if present
+    if update.effective_user:
+        if update.effective_user.username:
+            payload["username"] = update.effective_user.username
+        if update.effective_user.full_name:
+            payload["full_name"] = update.effective_user.full_name
+
+    try:
+        resp = requests.post(f"{BACKEND_URL}/accounts/", json=payload, timeout=10)
+        if resp.status_code in (200, 201):
+            await update.message.reply_text("Phone number saved. You can continue in the WebApp.")
+        else:
+            logging.error(f"Failed to save phone number: {resp.status_code} {resp.text}")
+            await update.message.reply_text("Failed to save your phone number. Please try again.")
+    except Exception as e:
+        logging.error(f"Error saving phone number: {e}")
+        await update.message.reply_text("Failed to save your phone number. Please try again.")
+
 # ---------------- Startup / Shutdown ----------------
 @app.on_event("startup")
 async def startup():
     global telegram_app
     telegram_app = Application.builder().token(TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -110,3 +154,19 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.post("/telegram/send")
+async def send_message(payload: SendMessagePayload):
+    if not telegram_app or not telegram_app.bot:
+        raise HTTPException(status_code=503, detail="Bot not initialized")
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(payload.button_text, web_app=WebAppInfo(url=payload.button_url))]]
+    )
+    await telegram_app.bot.send_message(
+        chat_id=payload.telegram_id,
+        text=payload.message,
+        reply_markup=keyboard,
+    )
+    return {"ok": True}
